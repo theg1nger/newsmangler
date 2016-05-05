@@ -33,6 +33,7 @@ import os
 import select
 import sys
 import time
+import shutil
 
 from cStringIO import StringIO
 
@@ -323,7 +324,7 @@ class PostMangler:
     # -----------------------------------------------------------------------
     # Generate a .NZB file!
     def generate_nzb(self):
-        filename = 'newsmangler_%s.nzb' % (SafeFilename(self._current_dir))
+        filename = '%s.nzb' % (SafeFilename(self._current_dir))
 
         self.logger.info('Begin generation of %s', filename)
 
@@ -366,5 +367,15 @@ class PostMangler:
             ET.ElementTree(root).write(nzbfile, xml_declaration=True)
 
         self.logger.info('End generation of %s', filename)
-
+	
+	#Copying NZB to different location
+	end_folder = self.conf['posting']['final_folder']
+	if end_folder:
+	    self.logger.info('Copying NZB file, %s, to config defined location,', end_folder)
+	    endNzb = os.path.join(end_folder, filename)
+	    shutil.copyfile(filename, endNzb)
+	    if os.path.isfile(endNzb):
+	       self.logger.info('Finished copying NZB file')
+	       os.remove(filename)
+	       self.logger.info('Deleteing original NZB file after copied')
 # ---------------------------------------------------------------------------
