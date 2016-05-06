@@ -1,21 +1,20 @@
-==================
-**IMPORTANT NOTE**
-==================
-This project is no longer being actively maintained. It still works fine but no
-new features will ever be appearing. Check out `my GoPostStuff project <https://github.com/madcowfred/GoPostStuff/>`_
-for a new and much scarier version of the idea.
-
-
-
 newsmangler
 ===========
 
 newsmangler is a basic client for posting binaries to Usenet. The only notable
 feature is multiple connection support to efficiently utilize modern bandwidth.
+It supports SSL connection !
+
+Requirements
+============
+
+Python 2.6 or newer (including Python 3).
+For SSL connection you will need OpenSSL:
+``pip install python-openssl`` or ``sudo aptitude install python-openssl`` (debian/ubuntu)
 
 Installation
 ============
-#. Download the source: ``git clone git://github.com/madcowfred/newsmangler.git``
+#. Download the source: ``git clone git://github.com/nicors57/newsmangler.git``
    (or download a .zip I guess).
 
 #. Copy sample.conf to ~/.newsmangler.conf, edit the options as appropriate.
@@ -43,3 +42,8 @@ The files will post as:
   ``test post please ignore [3/3] - "test.part2.rar" yEnc (01/27)``
 
 See ``python mangler.py --help`` for other options.
+
+Notes
+=====
+
+Upload using Python3 is slower (~20%) than using python2.

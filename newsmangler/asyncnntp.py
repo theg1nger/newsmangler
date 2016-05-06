@@ -34,6 +34,51 @@ import re
 import select
 import socket
 import time
+from nntplib import *
+import tempfile
+import sys
+
+
+# ---------------------------------------------------------------------------
+
+try:
+    from OpenSSL import SSL
+    _ssl = SSL
+    WantReadError = _ssl.WantReadError
+    WantWriteError = _ssl.WantWriteError
+    del SSL
+    HAVE_SSL = True
+
+except ImportError:
+    _ssl = None
+    HAVE_SSL = False
+
+
+import threading
+_RLock = threading.RLock
+del threading
+
+import select
+
+class SSLConnection(object):
+    def __init__(self, *args):
+        self._ssl_conn = _ssl.Connection(*args)
+        self._lock = _RLock()
+
+    for f in ('get_context', 'pending', 'send', 'write', 'recv', 'read',
+              'renegotiate', 'bind', 'listen', 'connect', 'accept',
+              'setblocking', 'fileno', 'shutdown', 'close', 'get_cipher_list',
+              'getpeername', 'getsockname', 'getsockopt', 'setsockopt',
+              'makefile', 'get_app_data', 'set_app_data', 'state_string',
+              'sock_shutdown', 'get_peer_certificate', 'want_read',
+              'want_write', 'set_connect_state', 'set_accept_state',
+              'connect_ex', 'sendall', 'do_handshake', 'settimeout'):
+        exec("""def %s(self, *args):
+            self._lock.acquire()
+            try:
+                return self._ssl_conn.%s(* args)
+            finally:
+                self._lock.release()\n""" % (f, f))
 
 # ---------------------------------------------------------------------------
 
@@ -56,7 +101,7 @@ MSGID_RE = re.compile(r'(<\S+@\S+>)')
 # ---------------------------------------------------------------------------
 
 class asyncNNTP(asyncore.dispatcher):
-    def __init__(self, parent, connid, host, port, bindto, username, password):
+    def __init__(self, parent, connid, host, port, bindto, username, password, ssl = False):
         asyncore.dispatcher.__init__(self)
         
         self.logger = logging.getLogger('mangler')
@@ -68,12 +113,13 @@ class asyncNNTP(asyncore.dispatcher):
         self.bindto = bindto
         self.username = username
         self.password = password
+        self.ssl = ssl
         
         self.reset()
     
     def reset(self):
-        self._readbuf = ''
-        self._writebuf = ''
+        self._readbuf = b''
+        self._writebuf = b''
         self._article = None
         self._pointer = 0
         
@@ -83,36 +129,55 @@ class asyncNNTP(asyncore.dispatcher):
 
     def do_connect(self):
         # Create the socket
-        self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
-        
-        # Try to set our send buffer a bit larger
-        for i in range(17, 13, -1):
+        if self.ssl and not HAVE_SSL:
+            self.logger.error("OPENSSL not installed but trying to use an SSL connection. SSL disabled.")
+            self.ssl = False
+
+        for res in socket.getaddrinfo(self.host, self.port, 0, socket.SOCK_STREAM):
+            af, socktype, proto, canonname, sa = res
+            self.create_socket(af,socktype)
+
+            if self.ssl:
+                ctx = _ssl.Context(_ssl.SSLv23_METHOD)
+                self.socket = SSLConnection(ctx, self.socket)
+
+            # Try to set our send buffer a bit larger
+            for i in range(17, 13, -1):
+                try:
+                    self.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2**i)
+                except socket.error:
+                    continue
+                else:
+                    break
+
+            # Try to connect. This can blow up!
             try:
-                self.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2**i)
-            except socket.error:
-                continue
+                self.connect((self.host, self.port))
+            except (socket.error, socket.gaierror) as msg:
+                self.really_close(msg)
             else:
-                break
-        self.logger.debug('%d: SO_SNDBUF is %s', self.connid, self.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF))
-        
-        # If we have to bind our socket to an IP, do that
-        #if self.bindto is not None:
-        #    self.bind((self.bindto, 0))
-        
-        # Try to connect. This can blow up!
-        try:
-            self.connect((self.host, self.port))
-        except (socket.error, socket.gaierror), msg:
-            self.really_close(msg)
-        else:
-            self.state = STATE_CONNECTING
-            self.logger.debug('%d: connecting to %s:%s', self.connid, self.host, self.port)
+                # Handshake
+                if self.ssl:
+                    # Waiting socket wants read and write
+                    while True:
+                        try:
+                            self.socket.do_handshake()
+                            break
+                        except WantWriteError:
+                            select.select([self.socket], [], [], 0.1)
+                        except WantReadError:
+                            select.select([self.socket], [], [], 0.1)
+
+                self.state = STATE_CONNECTING
+                self.logger.debug('%d: connecting to %s:%s', self.connid, self.host, self.port)
+
+            break       
     
     # -----------------------------------------------------------------------
     # Check to see if it's time to reconnect yet
     def reconnect_check(self, now):
-    	if self.state == STATE_DISCONNECTED and now >= self.reconnect_at:
-        	self.do_connect()
+        if self.state == STATE_DISCONNECTED and now >= self.reconnect_at:
+            self.do_connect()
 
     def add_channel(self, map=None):
         self.logger.debug('%d: adding FD %d to poller', self.connid, self._fileno)
@@ -136,6 +201,7 @@ class asyncNNTP(asyncore.dispatcher):
                 pass
 
     def close(self):
+        self.logger.debug('close')
         self.del_channel()
         if self.socket is not None:
             self.socket.close()
@@ -144,23 +210,33 @@ class asyncNNTP(asyncore.dispatcher):
     # We only want to be writable if we're connecting, or something is in our
     # buffer.
     def writable(self):
+        self.logger.debug('writable')
         return (not self.connected) or len(self._writebuf)
     
     # Send some data from our buffer when we can write
     def handle_write(self):
-        #self.logger.debug('%d wants to write!', self._fileno)
+        self.logger.debug('%d wants to write!', self._fileno)
         
         if not self.writable():
             # We don't have any buffer, silly thing
             asyncore.poller.register(self._fileno, select.POLLIN)
             return
-        
-        sent = asyncore.dispatcher.send(self, self._writebuf[self._pointer:])
+
+        # Windows generate WantWriteError/WantReadError for SSL connection
+        while True:
+            try:
+                sent = asyncore.dispatcher.send(self, self._writebuf[self._pointer:])
+                break
+            except WantWriteError:
+                select.select([self.socket], [], [], 0.1)
+            except WantReadError:
+                select.select([self.socket], [], [], 0.1)
+
         self._pointer += sent
         
         # We've run out of data
         if self._pointer == len(self._writebuf):
-            self._writebuf = ''
+            self._writebuf = b''
             self._pointer = 0
             asyncore.poller.register(self._fileno, select.POLLIN)
         
@@ -176,7 +252,7 @@ class asyncNNTP(asyncore.dispatcher):
         self._writebuf += data
         # We need to know about writable things now
         asyncore.poller.register(self._fileno)
-        #self.logger.debug('%d has data!', self._fileno)
+        self.logger.debug('%d has data!', self._fileno)
     
     # -----------------------------------------------------------------------
     
@@ -207,14 +283,15 @@ class asyncNNTP(asyncore.dispatcher):
     
     # There is some data waiting to be read
     def handle_read(self):
+        self.logger.debug('handle_read')
         try:
-            self._readbuf += self.recv(16384)
-        except socket.error, msg:
+            self._readbuf = b"".join([self._readbuf,self.recv(16384)])
+        except socket.error as msg:
             self.really_close(msg)
             return
         
         # Split the buffer into lines. Last line is always incomplete.
-        lines = self._readbuf.split('\r\n')
+        lines = self._readbuf.split(b'\r\n')
         self._readbuf = lines.pop()
         
         # Do something useful here
@@ -226,10 +303,10 @@ class asyncNNTP(asyncore.dispatcher):
                 resp = line.split(None, 1)[0]
                 
                 # Welcome... post, no post
-                if resp in ('200', '201'):
+                if resp in (b'200', b'201'):
                     if self.username:
                         text = 'AUTHINFO USER %s\r\n' % (self.username)
-                        self.send(text)
+                        self.send(text.encode('utf8'))
                         self.logger.debug('%d: > AUTHINFO USER ********', self.connid)
                     else:
                         self.mode = MODE_COMMAND
@@ -237,22 +314,22 @@ class asyncNNTP(asyncore.dispatcher):
                         self.logger.debug('%d: ready.', self.connid)
                 
                 # Need password too
-                elif resp in ('381'):
+                elif resp in (b'381'):
                     if self.password:
                         text = 'AUTHINFO PASS %s\r\n' % (self.password)
-                        self.send(text)
+                        self.send(text.encode('utf8'))
                         self.logger.debug('%d: > AUTHINFO PASS ********', self.connid)
                     else:
                         self.really_close('need password!')
                 
                 # Auth ok
-                elif resp in ('281'):
+                elif resp in (b'281'):
                     self.mode = MODE_COMMAND
                     self.parent._idle.append(self)
                     self.logger.debug('%d: ready.', self.connid)
                 
                 # Auth failure
-                elif resp in ('502'):
+                elif resp in (b'502'):
                     self.really_close('authentication failure.')
                 
                 # Dunno
@@ -264,12 +341,12 @@ class asyncNNTP(asyncore.dispatcher):
             elif self.mode == MODE_POST_INIT:
                 resp = line.split(None, 1)[0]
                 # Posting is allowed
-                if resp == '340':
+                if resp == b'340':
                     self.mode = MODE_POST_DATA
                     
                     # TODO: use the suggested message-ID, will require some rethinking as to how
                     #       messages are constructed
-                    m = MSGID_RE.search(line)
+                    m = MSGID_RE.search(line.decode('utf8'))
                     if m:
                         self.logger.debug('%d: changing Message-ID to %s', self.connid, m.group(1))
                         self._article.headers['Message-ID'] = m.group(1)
@@ -281,7 +358,7 @@ class asyncNNTP(asyncore.dispatcher):
                     self.post_data()
                 
                 # Posting is not allowed
-                elif resp == '440':
+                elif resp == b'440':
                     self.mode = MODE_COMMAND
                     self.parent._idle.append(self)
                     del self._article
@@ -296,14 +373,14 @@ class asyncNNTP(asyncore.dispatcher):
             elif self.mode == MODE_POST_DONE:
                 resp = line.split(None, 1)[0]
                 # Ok
-                if resp == '240':
+                if resp == b'240':
                     #self.parent.post_success(self._article)
 
                     self.mode = MODE_COMMAND
                     self.parent._idle.append(self)
 
                 # Not ok
-                elif resp.startswith('44'):
+                elif resp.startswith(b'44'):
                     self.mode = MODE_COMMAND
                     self.parent._idle.append(self)
                     self.logger.warning('%d: posting failed - %s', self.connid, line)
@@ -321,18 +398,25 @@ class asyncNNTP(asyncore.dispatcher):
     # -----------------------------------------------------------------------
     # Guess what this does!
     def post_article(self, article):
+        self.logger.debug('post_article')
         self.mode = MODE_POST_INIT
         self._article = article
-        self.send('POST\r\n')
+        self.send(b'POST\r\n')
         self.logger.debug('%d: > POST', self.connid)
     
     def post_data(self):
+        self.logger.debug('post_data')
         data = self._article.postfile.read(POST_READ_SIZE)
         if len(data) == 0:
             self.mode = MODE_POST_DONE
             self._article.postfile.close()
             self._article.postfile = None
         
+        if len(data) > 0:
+            f = open('/tmp/test','wb')
+            f.write(data)
+            f.close()
         self.send(data)
 
 # ---------------------------------------------------------------------------
+

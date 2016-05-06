@@ -27,15 +27,19 @@
 
 """Main class for posting stuff."""
 
+from __future__ import print_function
 import asyncore
 import logging
 import os
 import select
 import sys
 import time
-import shutil
 
-from cStringIO import StringIO
+try:
+    from cStringIO import StringIO
+except ImportError:
+    #python 3.x
+    from io import StringIO
 
 try:
     import xml.etree.cElementTree as ET
@@ -48,6 +52,10 @@ from newsmangler.article import Article
 from newsmangler.common import *
 from newsmangler.filewrap import FileWrap
 
+# ---------------------------------------------------------------------------
+GB = 1024*1024*1024
+MB = GB/1024
+KB = MB/1024
 # ---------------------------------------------------------------------------
 
 class PostMangler:
@@ -79,6 +87,9 @@ class PostMangler:
             self.logger.info('Using FakePoll() for sockets')
 
         self.conf['posting']['skip_filenames'] = self.conf['posting'].get('skip_filenames', '').split()
+        self.ssl = self.conf['server'].get('ssl')
+        if self.ssl:
+            self.logger.info("SSL enabled. Connections can take more time to be established.")
         
         self._articles = []
         self._files = {}
@@ -94,10 +105,15 @@ class PostMangler:
     # -----------------------------------------------------------------------
     # Connect all of our connections
     def connect(self):
+
         for i in range(self.conf['server']['connections']):
-            conn = asyncnntp.asyncNNTP(self, i, self.conf['server']['hostname'],
-                self.conf['server']['port'], None, self.conf['server']['username'],
+            conn = asyncnntp.asyncNNTP(self, i, 
+                self.conf['server']['hostname'],
+                self.conf['server']['port'], 
+                None, 
+                self.conf['server']['username'],
                 self.conf['server']['password'],
+                self.ssl
             )
             conn.do_connect()
             self._conns.append(conn)
@@ -128,6 +144,40 @@ class PostMangler:
 
     # -----------------------------------------------------------------------
 
+    def get_average_remaining_time(self):
+        # Try to get average total time to process all articles
+        # Then decrease this time with elapsed time to get remaining time
+
+        now = time.time()
+
+        # average speed (bytes processed since last 5 min) in bytes/s
+        speed = self._bytes / (now - self.start_time )
+        self._avg_speeds.append(speed)
+        avg_speed = float(sum(self._avg_speeds[-60:])) / float(len(self._avg_speeds[-60:]))
+
+        # time to process all articles with average speed
+        total_avg_time = float(self._size) / avg_speed
+        remaining_time = float(self.rsize) / (float(speed + avg_speed) / float(2))
+
+        # Format times in minutes and seconds
+        if total_avg_time:
+            # Total average time formating
+            if total_avg_time > 60:
+                avg_time = "%s minutes %s secondes"%(int(total_avg_time/60),int((float(total_avg_time/60) - int(total_avg_time/60)) * 60))
+            else:
+                avg_time = "%s secondes" % (int(total_avg_time))
+
+            # Remaining average time formating
+            if remaining_time > 60:
+                avg_rtime = "%s minutes %s secondes"%(int(remaining_time/60),int((float(remaining_time/60) - int(remaining_time/60)) * 60))
+            else:
+                avg_rtime = "%s secondes"%int(remaining_time)
+        else:
+            avg_time = avg_rtime = 'inf.'
+
+        return (avg_speed, avg_rtime, avg_time)
+
+
     def post(self, newsgroup, postme, post_title=None):
         self.newsgroup = newsgroup
         self.post_title = post_title
@@ -135,6 +185,8 @@ class PostMangler:
         # Generate the list of articles we need to post
         self.generate_article_list(postme)
         
+        self._size = len(self._articles) * self.conf['posting']['article_size']
+
         # If we have no valid articles, bail
         if not self._articles:
             self.logger.warning('No valid articles to post!')
@@ -143,12 +195,17 @@ class PostMangler:
         # Connect!
         self.connect()
 
-        # And loop
+        # _bytes will contain total bytes sent
         self._bytes = 0
-        last_stuff = start = time.time()
+        # _avg_speed will be used to estimate average speed
+        self._avg_speeds = []
+        
+        self.start_time = last_stuff = time.time()
+        aleft = left = len(self._articles)
         
         self.logger.info('Posting %d article(s)...', len(self._articles))
         
+        # And loop
         while 1:
             now = time.time()
             
@@ -169,18 +226,33 @@ class PostMangler:
                 	conn.reconnect_check(now)
                 
                 if self._bytes:
-                    interval = time.time() - start
-                    speed = self._bytes / interval / 1024
+                    # Due to some more data sent, get remaining bytes using remaining articles
+                    self.rsize = len(self._articles) * self.conf['posting']['article_size']
+
+                    if self.rsize > GB:
+                        rsize = "%.2fGB" % (float(self.rsize) / float(GB))
+                    elif self.rsize > MB:
+                        rsize = "%.2fMB" % (float(self.rsize) / float(MB))
+                    else:
+                        rsize = "%.2fKB" % (float(self.rsize) / float(KB))
+
+                    # get already formated remaining time (avg speed and avg total time also returned)
+                    avg_speed, avg_rtime, avg_time = self.get_average_remaining_time()
+
+                    interval = time.time() - self.start_time
                     left = len(self._articles) + (len(self._conns) - len(self._idle))
-                    print '%d article(s) remaining - %.1fKB/s     \r' % (left, speed),
+                    speed = self._bytes / interval / 1024
+
+                    print('%d article(s) remaining (%s) - time left %s  - %.1fKB/s                \r' % 
+                            (left,rsize,avg_rtime, speed), end="")
                     sys.stdout.flush()
             
             # All done?
             if len(self._articles) == 0 and len(self._idle) == self.conf['server']['connections']:
-                interval = time.time() - start
+                interval = time.time() - self.start_time
                 speed = self._bytes / interval
-                self.logger.info('Posting complete - %s in %s (%s/s)',
-                    NiceSize(self._bytes), NiceTime(interval), NiceSize(speed))
+                self.logger.info('Posting complete - %s (%s) in %s (%s/s) avg time: %s',
+                    NiceSize(self._bytes),self._bytes, NiceTime(interval), NiceSize(speed), avg_time)
                 
                 # If we have some msgids left over, we might have to generate
                 # a .NZB
@@ -255,9 +327,9 @@ class PostMangler:
             # Build a subject
             real_filename = os.path.split(filename)[1]
             
-            temp = '%%0%sd' % (len(str(len(files))))
-            filenum = temp % (n)
-            temp = '%%0%sd' % (len(str(parts)))
+            temp = '%%0%sd' % len(str(len(files)))
+            filenum = temp % n
+            temp = '%%0%sd' % len(str(parts))
             subject = '%s [%s/%d] - "%s" yEnc (%s/%d)' % (
                 post_title, filenum, len(goodfiles), real_filename, temp, parts
             )
@@ -324,7 +396,7 @@ class PostMangler:
     # -----------------------------------------------------------------------
     # Generate a .NZB file!
     def generate_nzb(self):
-        filename = '%s.nzb' % (SafeFilename(self._current_dir))
+        filename = 'newsmangler_%s.nzb' % (SafeFilename(self._current_dir))
 
         self.logger.info('Begin generation of %s', filename)
 
@@ -343,13 +415,13 @@ class PostMangler:
                     'subject': subject,
                 }
             )
-
+            
             # newsgroups
             groups = ET.SubElement(f, 'groups')
             for newsgroup in self.newsgroup.split(','):
                 group = ET.SubElement(groups, 'group')
                 group.text = newsgroup
-
+            
             # segments
             segments = ET.SubElement(f, 'segments')
             temp = [(m._partnum, m, article_size) for m, article_size in msgids]
@@ -363,19 +435,28 @@ class PostMangler:
                 )
                 segment.text = str(article.headers['Message-ID'][1:-1])
 
-        with open(filename, 'w') as nzbfile:
-            ET.ElementTree(root).write(nzbfile, xml_declaration=True)
+        # pretty print
+        def indent(elem, level=0):
+            i = "\n" + level*"  "
+            if len(elem):
+                if not elem.text or not elem.text.strip():
+                    elem.text = i + "  "
+                if not elem.tail or not elem.tail.strip():
+                    elem.tail = i
+                for elem in elem:
+                    indent(elem, level+1)
+                if not elem.tail or not elem.tail.strip():
+                    elem.tail = i
+            else:
+                if level and (not elem.tail or not elem.tail.strip()):
+                    elem.tail = i
 
+
+        with open(filename, 'wb') as nzbfile:
+            indent(root)
+            ET.ElementTree(root).write(nzbfile, xml_declaration=True)
+            
         self.logger.info('End generation of %s', filename)
-	
-	#Copying NZB to different location
-	end_folder = self.conf['posting']['final_folder']
-	if end_folder:
-	    self.logger.info('Copying NZB file, %s, to config defined location,', end_folder)
-	    endNzb = os.path.join(end_folder, filename)
-	    shutil.copyfile(filename, endNzb)
-	    if os.path.isfile(endNzb):
-	       self.logger.info('Finished copying NZB file')
-	       os.remove(filename)
-	       self.logger.info('Deleteing original NZB file after copied')
+
 # ---------------------------------------------------------------------------
+
