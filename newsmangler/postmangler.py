@@ -462,11 +462,11 @@ class PostMangler:
 	#Copying NZB to different location
 	end_folder = self.conf['posting']['final_folder']
 	if end_folder:
-	    self.logger.info('Copying NZB file, %s, to config defined location,', end_folder)
+	    self.logger.info('Copying NZB file: %s to config defined location: %s' % (filename,  end_folder))
 	    endNzb = os.path.join(end_folder, filename)
 	    shutil.copyfile(filename, endNzb)
 	    if os.path.isfile(endNzb):
-	       self.logger.info('Finished copying NZB file')
+	       self.logger.info('Finished copying NZB file to %s', end_folder)
 	       os.remove(filename)
 	       self.logger.info('Deleteing original NZB file after copied')
 
